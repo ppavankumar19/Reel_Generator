@@ -544,6 +544,17 @@ def _cleanup_prev_run(project_dir):
             ws.unlink()
             print_step("Removed stale pnpm-workspace.yaml")
 
+    # 4. Restore pnpm-lock.yaml from git if we deleted it in a previous run
+    #    so pnpm-workspace.yaml changes are the only diff going into re-resolution
+    lockfile = project_dir / "pnpm-lock.yaml"
+    if not lockfile.exists() and (project_dir / ".git").exists():
+        result = subprocess.run(
+            ["git", "checkout", "HEAD", "--", "pnpm-lock.yaml"],
+            cwd=str(project_dir), capture_output=True
+        )
+        if result.returncode == 0:
+            print_step("Restored pnpm-lock.yaml from git")
+
 
 def _parse_blocked_pkgs(pnpm_output):
     """Extract package names from ERR_PNPM_IGNORED_BUILDS output."""
@@ -619,6 +630,17 @@ def _allow_pnpm_builds(project_dir, pnpm_output):
                 data.pop("pnpm", None)
             pkg_json_path.write_text(json.dumps(data, indent=2) + "\n")
             print_success("Removed stale pnpm.onlyBuiltDependencies from package.json")
+
+    # --- Delete pnpm-lock.yaml so pnpm regenerates it with the new setting ---
+    # pnpm caches onlyBuiltDependencies INSIDE the lockfile. Even after updating
+    # pnpm-workspace.yaml, if the lockfile is "up to date" pnpm skips re-resolution
+    # and still reads the OLD onlyBuiltDependencies from the lockfile — causing
+    # ERR_PNPM_IGNORED_BUILDS again. Deleting the lockfile forces pnpm to regenerate
+    # it from package.json, picking up the new pnpm-workspace.yaml settings.
+    lockfile = project_dir / "pnpm-lock.yaml"
+    if lockfile.exists():
+        lockfile.unlink()
+        print_step("Deleted pnpm-lock.yaml — pnpm will regenerate it with correct settings")
 
 
 def install_dependencies(env, project_dir):
