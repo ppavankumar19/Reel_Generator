@@ -28,8 +28,10 @@ USAGE:
 """
 
 import argparse
+import json
 import os
 import platform
+import re
 import shutil
 import subprocess
 import sys
@@ -89,6 +91,12 @@ def run(cmd, *, cwd=None, env=None, check=True, shell=False, capture_output=Fals
             result = subprocess.run(cmd, cwd=cwd, env=env, shell=shell)
         
         if check and result.returncode != 0:
+            # Show captured output so the error is visible before raising
+            if capture_output:
+                if result.stdout:
+                    print(result.stdout, end="")
+                if result.stderr:
+                    print(result.stderr, end="", file=sys.stderr)
             raise RuntimeError(f"Command failed (exit {result.returncode}): {printable}")
         
         return result
@@ -250,9 +258,14 @@ def setup_homebrew_macos(env):
     """Install Homebrew on macOS"""
     brew = detect_brew_bin()
     if brew:
-        print_success("Homebrew found")
+        # Always ensure brew's bin dir is in PATH — critical on Apple Silicon
+        # where /opt/homebrew/bin may not be in the inherited env PATH
+        brew_dir = str(Path(brew).parent)
+        if brew_dir not in env.get("PATH", ""):
+            env["PATH"] = brew_dir + os.pathsep + env.get("PATH", "")
+        print_success(f"Homebrew found at {brew_dir}")
         return env
-    
+
     print_warning("Homebrew not found. Installing...")
     install_script = (
         '/bin/bash -c "$(curl -fsSL '
@@ -478,30 +491,94 @@ def setup_pnpm(env):
 
 
 def clone_or_validate_repo(env, repo_url, project_dir):
-    """Clone repository or validate existing directory"""
+    """Clone repository or validate existing directory."""
     package_json = project_dir / "package.json"
-    
+
     if package_json.exists():
         print_success(f"Project already exists at: {project_dir}")
         return
-    
+
+    # If dir exists but has no package.json, git clone would fail on non-empty dirs
+    if project_dir.exists() and any(project_dir.iterdir()):
+        raise RuntimeError(
+            f"Directory exists but contains no package.json: {project_dir}\n"
+            f"Remove it or choose a different --dir path."
+        )
+
     print_step(f"Cloning repository to: {project_dir}")
     project_dir.parent.mkdir(parents=True, exist_ok=True)
     run(["git", "clone", repo_url, str(project_dir)], env=env)
-    
+
     if not package_json.exists():
         raise RuntimeError(f"Clone succeeded but package.json not found in {project_dir}")
-    
+
     print_success("Repository cloned successfully")
 
 
+def _allow_pnpm_builds(project_dir, pnpm_output):
+    """
+    pnpm 9+ blocks package build scripts by default (ERR_PNPM_IGNORED_BUILDS).
+    This parses the blocked package names from the error output and adds them to
+    package.json under pnpm.onlyBuiltDependencies — the same thing 'pnpm approve-builds'
+    would do interactively.
+    """
+    m = re.search(r"Ignored build scripts:\s*([^\n]+)", pnpm_output)
+    pkgs_raw = m.group(1).strip() if m else ""
+    pkgs = []
+    for token in re.split(r"[,\s]+", pkgs_raw):
+        token = token.strip()
+        if not token:
+            continue
+        # Strip @version — handle scoped (@scope/name@ver) and plain (name@ver)
+        if token.startswith("@"):
+            name = "@" + token[1:].rsplit("@", 1)[0]
+        else:
+            name = token.split("@")[0]
+        if name:
+            pkgs.append(name)
+
+    if not pkgs:
+        print_warning("Could not parse blocked package names — retrying anyway")
+        return
+
+    print_step(f"Allowing build scripts for: {', '.join(pkgs)}")
+    pkg_json_path = project_dir / "package.json"
+    data = json.loads(pkg_json_path.read_text())
+    pnpm_cfg = data.setdefault("pnpm", {})
+    existing = pnpm_cfg.get("onlyBuiltDependencies", [])
+    merged = sorted(set(existing) | set(pkgs))
+    pnpm_cfg["onlyBuiltDependencies"] = merged
+    pkg_json_path.write_text(json.dumps(data, indent=2) + "\n")
+    print_success(f"package.json updated — onlyBuiltDependencies: {merged}")
+
+
 def install_dependencies(env, project_dir):
-    """Install project dependencies via pnpm"""
+    """Install project dependencies via pnpm, handling pnpm 9+ build-script approval."""
     print("\n" + "="*60)
     print("INSTALLING PROJECT DEPENDENCIES")
     print("="*60)
-    
-    run(["pnpm", "install"], env=env, cwd=str(project_dir))
+
+    result = run(
+        ["pnpm", "install"], env=env, cwd=str(project_dir),
+        check=False, capture_output=True
+    )
+
+    # Always show pnpm output
+    if result:
+        if result.stdout:
+            print(result.stdout, end="")
+        if result.stderr:
+            print(result.stderr, end="", file=sys.stderr)
+
+    if result and result.returncode != 0:
+        combined = (result.stdout or "") + (result.stderr or "")
+        if "ERR_PNPM_IGNORED_BUILDS" in combined or "approve-builds" in combined:
+            print_warning("pnpm 9+ blocked build scripts — auto-approving and retrying...")
+            _allow_pnpm_builds(project_dir, combined)
+            run(["pnpm", "install"], env=env, cwd=str(project_dir))
+        else:
+            raise RuntimeError("pnpm install failed (see output above)")
+
     print_success("Dependencies installed")
 
 
