@@ -103,6 +103,27 @@ def which(name: str):
     return shutil.which(name)
 
 
+def get_sudo():
+    """Return ['sudo'] if not root, else [] — works on Linux/macOS, skips on Windows."""
+    if os.name == 'nt':
+        return []
+    try:
+        if os.geteuid() == 0:
+            return []
+    except AttributeError:
+        return []
+    return ["sudo"]
+
+
+def is_wsl():
+    """Detect Windows Subsystem for Linux."""
+    try:
+        with open("/proc/version") as f:
+            return "microsoft" in f.read().lower()
+    except Exception:
+        return False
+
+
 def get_os():
     """Detect the operating system"""
     system = platform.system().lower()
@@ -314,74 +335,93 @@ def setup_macos(env):
 # LINUX SETUP
 # ============================================================================
 
-def update_apt():
-    """Update apt package lists"""
+def apt_env(env):
+    """Return env dict with DEBIAN_FRONTEND=noninteractive set."""
+    e = dict(env)
+    e["DEBIAN_FRONTEND"] = "noninteractive"
+    return e
+
+
+def update_apt(env):
+    """Update apt package lists."""
     print_step("Updating package lists...")
-    run(["sudo", "apt", "update"], check=True)
+    run(get_sudo() + ["apt-get", "update", "-y"], env=apt_env(env), check=True)
 
 
-def install_package_linux(package):
-    """Install a package using apt"""
-    # Check if installed
-    result = run(
-        ["dpkg", "-l", package], 
-        check=False, 
-        capture_output=True
-    )
-    
-    if result and result.returncode == 0 and package in result.stdout:
+def install_package_linux(package, env, required=True):
+    """Install a package using apt-get. Returns True if installed/available."""
+    # Use dpkg -s for reliable status check (checks 'Status: install ok installed')
+    result = run(["dpkg", "-s", package], check=False, capture_output=True)
+    if result and result.returncode == 0 and "Status: install ok installed" in result.stdout:
         print_success(f"{package} already installed")
-        return
-    
+        return True
+
     print_step(f"Installing {package}...")
-    run(["sudo", "apt", "install", "-y", package])
+    result = run(
+        get_sudo() + ["apt-get", "install", "-y", "--no-install-recommends", package],
+        env=apt_env(env),
+        check=required,
+    )
+    if result is None or result.returncode != 0:
+        print_warning(f"Optional package '{package}' could not be installed — skipping")
+        return False
     print_success(f"{package} installed")
+    return True
 
 
 def setup_node_linux(env):
-    """Install Node.js on Linux using NodeSource"""
+    """Install Node.js on Linux using NodeSource."""
     if which("node"):
         print_success("Node.js already installed")
         run(["node", "-v"], env=env)
         run(["npm", "-v"], env=env)
         return env
-    
+
     print_step("Installing Node.js LTS via NodeSource...")
-    
-    # Install Node.js 22.x LTS
+
     run([
-        "curl", "-fsSL", 
+        "curl", "-fsSL",
         "https://deb.nodesource.com/setup_22.x",
         "-o", "/tmp/nodesource_setup.sh"
     ], env=env)
-    
-    run(["sudo", "bash", "/tmp/nodesource_setup.sh"], env=env)
-    install_package_linux("nodejs")
-    
+
+    run(get_sudo() + ["bash", "/tmp/nodesource_setup.sh"], env=apt_env(env))
+    install_package_linux("nodejs", env, required=True)
+
+    # Ensure standard node bin paths are in PATH
+    for node_bin_dir in ("/usr/bin", "/usr/local/bin"):
+        if Path(node_bin_dir + "/node").exists():
+            if node_bin_dir not in env.get("PATH", ""):
+                env["PATH"] = node_bin_dir + os.pathsep + env.get("PATH", "")
+            break
+
     run(["node", "-v"], env=env)
     run(["npm", "-v"], env=env)
-    
+
     return env
 
 
 def setup_linux(env):
-    """Complete Linux setup"""
+    """Complete Linux/Ubuntu setup (native, WSL, Multipass)."""
+    headless = is_wsl()
+
     print("\n" + "="*60)
-    print("LINUX (UBUNTU/DEBIAN) SETUP")
+    if headless:
+        print("LINUX (UBUNTU/DEBIAN) SETUP — WSL detected")
+    else:
+        print("LINUX (UBUNTU/DEBIAN) SETUP")
     print("="*60)
-    
-    # Update package lists
-    update_apt()
-    
-    # Install packages
-    install_package_linux("git")
-    install_package_linux("curl")
-    install_package_linux("ffmpeg")
-    install_package_linux("mpv")
-    
-    # Node.js
+
+    update_apt(env)
+
+    install_package_linux("git", env)
+    install_package_linux("curl", env)
+    install_package_linux("ffmpeg", env)
+    # mpv is a display player — optional on headless/WSL/Multipass
+    install_package_linux("mpv", env, required=False)
+
     env = setup_node_linux(env)
-    
+
     return env
 
 
@@ -390,33 +430,50 @@ def setup_linux(env):
 # ============================================================================
 
 def setup_pnpm(env):
-    """Install pnpm package manager"""
+    """Install pnpm package manager."""
     if which("pnpm"):
         print_success("pnpm already installed")
         run(["pnpm", "-v"], env=env)
         return env
-    
+
     print_step("Installing pnpm...")
-    
-    # Try corepack first (modern Node.js)
+
+    # Try corepack first (bundled with Node.js 16+)
     if which("corepack"):
         print_step("Enabling pnpm via corepack...")
-        run(["corepack", "enable"], env=env, check=False)
+        # corepack enable writes shims to a system dir — needs sudo when Node is system-installed
+        run(get_sudo() + ["corepack", "enable"], env=env, check=False)
         run(["corepack", "prepare", "pnpm@latest", "--activate"], env=env, check=False)
-    
-    # Check if pnpm is now available
+
     if which("pnpm"):
         print_success("pnpm enabled via corepack")
         run(["pnpm", "-v"], env=env)
         return env
-    
-    # Fallback to npm global install
+
+    # Fallback: npm global install
     print_step("Installing pnpm globally via npm...")
     run(["npm", "install", "-g", "pnpm"], env=env)
-    
+
+    # npm global installs land in $(npm config get prefix)/bin — add to PATH
+    try:
+        npm_prefix = subprocess.check_output(
+            ["npm", "config", "get", "prefix"], env=env, text=True
+        ).strip()
+        npm_bin = Path(npm_prefix) / "bin"
+        if npm_bin.exists() and str(npm_bin) not in env.get("PATH", ""):
+            env["PATH"] = str(npm_bin) + os.pathsep + env.get("PATH", "")
+            print_step(f"Added {npm_bin} to PATH")
+    except Exception:
+        pass
+
+    if not which("pnpm"):
+        raise RuntimeError(
+            "pnpm installation failed. Try manually: npm install -g pnpm"
+        )
+
     run(["pnpm", "-v"], env=env)
     print_success("pnpm installed")
-    
+
     return env
 
 
