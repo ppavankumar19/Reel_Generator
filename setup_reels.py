@@ -364,6 +364,9 @@ def setup_linux(env):
     install_package_linux("curl", env)
     install_package_linux("ffmpeg", env)
     install_package_linux("mpv", env, required=False)
+    # Chromium for Remotion rendering — try both package names (distro-dependent)
+    if not install_package_linux("chromium-browser", env, required=False):
+        install_package_linux("chromium", env, required=False)
     env = setup_node_linux(env)
     return env
 
@@ -453,12 +456,37 @@ def install_dependencies(env, project_dir):
     print_success("Dependencies installed")
 
 
+def _find_system_chromium():
+    """Find system-installed Chromium path."""
+    for path in (
+        "/usr/bin/chromium-browser",
+        "/usr/bin/chromium",
+        "/usr/bin/google-chrome",
+        "/usr/bin/google-chrome-stable",
+    ):
+        if Path(path).exists():
+            return path
+    return None
+
+
 def render_video(env, project_dir):
     print("\n" + "="*60)
     print("RENDERING VIDEO")
     print("="*60)
 
-    run(["pnpm", "render"], env=env, cwd=str(project_dir))
+    render_env = dict(env)
+    if get_os() == "linux":
+        # Tell Puppeteer/Remotion to skip its own Chromium download
+        # and use the system-installed chromium instead (required on arm64)
+        render_env["PUPPETEER_SKIP_DOWNLOAD"] = "1"
+        chrome = _find_system_chromium()
+        if chrome:
+            render_env["PUPPETEER_EXECUTABLE_PATH"] = chrome
+            print_success(f"Using system Chromium: {chrome}")
+        else:
+            print_warning("System Chromium not found — render may fail")
+
+    run(["pnpm", "render"], env=render_env, cwd=str(project_dir))
 
     out_mp4 = project_dir / "out" / "video.mp4"
 
