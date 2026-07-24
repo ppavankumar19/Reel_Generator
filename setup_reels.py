@@ -472,6 +472,19 @@ def setup_pnpm(env):
     return env
 
 
+def setup_pnpm_build_config(env):
+    """
+    Set pnpm config to allow build scripts for native packages BEFORE cloning.
+    Writing this globally means it applies when pnpm install runs in any project
+    directory, so no project-level file patching is needed.
+    """
+    print_step("Configuring pnpm to allow build scripts for native packages...")
+    # pnpm config set without --location writes to the user-level ~/.npmrc
+    run(["pnpm", "config", "set", "onlyBuiltDependencies", "esbuild"],
+        env=env, check=False, capture_output=True)
+    print_success("pnpm global config: onlyBuiltDependencies = esbuild")
+
+
 def clone_or_validate_repo(env, repo_url, project_dir):
     """Clone repository or validate existing directory."""
     package_json = project_dir / "package.json"
@@ -600,35 +613,24 @@ def _allow_pnpm_builds(project_dir, pnpm_output, env):
 
 
 def install_dependencies(env, project_dir):
-    """Install project dependencies via pnpm, handling pnpm 9+ build-script approval."""
+    """Install project dependencies via pnpm."""
     print("\n" + "="*60)
     print("INSTALLING PROJECT DEPENDENCIES")
     print("="*60)
 
-    # Always wipe stale artifacts from any previous failed run before starting
-    _cleanup_prev_run(project_dir)
+    # Delete the committed pnpm-lock.yaml before installing.
+    # The repo's lockfile was created before onlyBuiltDependencies was configured,
+    # so it has the wrong value baked in. Pnpm reads onlyBuiltDependencies FROM
+    # the lockfile (not from config) when the lockfile is "up to date", which
+    # causes ERR_PNPM_IGNORED_BUILDS even after setting pnpm config.
+    # Deleting it forces pnpm to re-resolve from package.json and pick up
+    # the global config we set in setup_pnpm_build_config().
+    lockfile = project_dir / "pnpm-lock.yaml"
+    if lockfile.exists():
+        lockfile.unlink()
+        print_step("Deleted pnpm-lock.yaml — forcing fresh resolution with correct build config")
 
-    result = run(
-        ["pnpm", "install"], env=env, cwd=str(project_dir),
-        check=False, capture_output=True
-    )
-
-    # Always show pnpm output
-    if result:
-        if result.stdout:
-            print(result.stdout, end="")
-        if result.stderr:
-            print(result.stderr, end="", file=sys.stderr)
-
-    if result and result.returncode != 0:
-        combined = (result.stdout or "") + (result.stderr or "")
-        if "ERR_PNPM_IGNORED_BUILDS" in combined or "approve-builds" in combined:
-            print_warning("pnpm blocked build scripts — auto-approving and retrying...")
-            _allow_pnpm_builds(project_dir, combined, env)
-            run(["pnpm", "install"], env=env, cwd=str(project_dir))
-        else:
-            raise RuntimeError("pnpm install failed (see output above)")
-
+    run(["pnpm", "install"], env=env, cwd=str(project_dir))
     print_success("Dependencies installed")
 
 
@@ -744,10 +746,13 @@ Examples:
     elif os_type == "linux":
         env = setup_linux(env)
     
-    # Common setup
+    # Install pnpm
     env = setup_pnpm(env)
-    
-    # Repository
+
+    # Configure pnpm globally BEFORE cloning so pnpm install works first time
+    setup_pnpm_build_config(env)
+
+    # Clone repository
     clone_or_validate_repo(env, args.repo, project_dir)
     
     # Install dependencies
