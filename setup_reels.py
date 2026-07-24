@@ -374,19 +374,27 @@ def setup_linux(env):
 
 def setup_pnpm(env):
     """Install pnpm 9 — the last major version without ERR_PNPM_IGNORED_BUILDS."""
-    # Check if pnpm v9 is already installed
+    current_ver = None
     if which("pnpm"):
         try:
-            ver = subprocess.check_output(["pnpm", "-v"], env=env, text=True).strip()
-            if ver.startswith("9."):
-                print_success(f"pnpm {ver} already installed")
-                return env
-            print_warning(f"pnpm {ver} detected — reinstalling pnpm@9 to avoid build script restrictions")
+            current_ver = subprocess.check_output(["pnpm", "-v"], env=env, text=True).strip()
         except Exception:
             pass
 
+    if current_ver and current_ver.startswith("9."):
+        print_success(f"pnpm {current_ver} already installed")
+        return env
+
+    if current_ver:
+        print_warning(f"pnpm {current_ver} detected — replacing with pnpm@9")
+        # Remove existing pnpm binaries so npm can install cleanly
+        for binary in ("pnpm", "pnpx", "pnpm.cmd", "pnpx.cmd"):
+            path = which(binary)
+            if path:
+                run(get_sudo() + ["rm", "-f", path], env=env, check=False)
+
     print_step("Installing pnpm@9 globally via npm...")
-    run(get_sudo() + ["npm", "install", "-g", "pnpm@9", "--force"], env=env)
+    run(get_sudo() + ["npm", "install", "-g", "pnpm@9"], env=env)
 
     # Ensure npm global bin dir is in PATH
     try:
