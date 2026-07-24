@@ -386,7 +386,7 @@ def setup_pnpm(env):
             pass
 
     print_step("Installing pnpm@9 globally via npm...")
-    run(get_sudo() + ["npm", "install", "-g", "pnpm@9"], env=env)
+    run(get_sudo() + ["npm", "install", "-g", "pnpm@9", "--force"], env=env)
 
     # Ensure npm global bin dir is in PATH
     try:
