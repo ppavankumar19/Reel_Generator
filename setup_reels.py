@@ -515,41 +515,68 @@ def clone_or_validate_repo(env, repo_url, project_dir):
     print_success("Repository cloned successfully")
 
 
-def _allow_pnpm_builds(project_dir, pnpm_output):
-    """
-    pnpm 9+ blocks package build scripts by default (ERR_PNPM_IGNORED_BUILDS).
-    This parses the blocked package names from the error output and adds them to
-    package.json under pnpm.onlyBuiltDependencies — the same thing 'pnpm approve-builds'
-    would do interactively.
-    """
+def _parse_blocked_pkgs(pnpm_output):
+    """Extract package names from ERR_PNPM_IGNORED_BUILDS output."""
     m = re.search(r"Ignored build scripts:\s*([^\n]+)", pnpm_output)
-    pkgs_raw = m.group(1).strip() if m else ""
+    if not m:
+        return []
     pkgs = []
-    for token in re.split(r"[,\s]+", pkgs_raw):
+    for token in re.split(r"[,\s]+", m.group(1).strip()):
         token = token.strip()
         if not token:
             continue
         # Strip @version — handle scoped (@scope/name@ver) and plain (name@ver)
-        if token.startswith("@"):
-            name = "@" + token[1:].rsplit("@", 1)[0]
-        else:
-            name = token.split("@")[0]
+        name = ("@" + token[1:].rsplit("@", 1)[0]) if token.startswith("@") else token.split("@")[0]
         if name:
             pkgs.append(name)
+    return pkgs
 
+
+def _allow_pnpm_builds(project_dir, pnpm_output):
+    """
+    pnpm 9+ blocks package build scripts (ERR_PNPM_IGNORED_BUILDS).
+    In pnpm 10+, the setting moved OUT of package.json into .npmrc.
+    Writes  onlyBuiltDependencies[]=<pkg>  to the project .npmrc file,
+    which is the correct location for all current pnpm versions.
+    Also removes the stale package.json entry that triggers the WARN.
+    """
+    pkgs = _parse_blocked_pkgs(pnpm_output)
     if not pkgs:
         print_warning("Could not parse blocked package names — retrying anyway")
         return
 
     print_step(f"Allowing build scripts for: {', '.join(pkgs)}")
+
+    # --- Write to .npmrc (correct location for pnpm 9.x / 10+) ---
+    npmrc_path = project_dir / ".npmrc"
+    existing = npmrc_path.read_text() if npmrc_path.exists() else ""
+    new_lines = [f"onlyBuiltDependencies[]={p}" for p in pkgs
+                 if f"onlyBuiltDependencies[]={p}" not in existing]
+    if new_lines:
+        with open(npmrc_path, "a") as f:
+            if existing and not existing.endswith("\n"):
+                f.write("\n")
+            f.write("# Allow build scripts (added by setup_reels.py)\n")
+            for line in new_lines:
+                f.write(line + "\n")
+        print_success(f".npmrc updated: {new_lines}")
+
+    # --- Remove stale package.json entry that causes the pnpm WARN ---
     pkg_json_path = project_dir / "package.json"
-    data = json.loads(pkg_json_path.read_text())
-    pnpm_cfg = data.setdefault("pnpm", {})
-    existing = pnpm_cfg.get("onlyBuiltDependencies", [])
-    merged = sorted(set(existing) | set(pkgs))
-    pnpm_cfg["onlyBuiltDependencies"] = merged
-    pkg_json_path.write_text(json.dumps(data, indent=2) + "\n")
-    print_success(f"package.json updated — onlyBuiltDependencies: {merged}")
+    if pkg_json_path.exists():
+        try:
+            data = json.loads(pkg_json_path.read_text())
+            pnpm_section = data.get("pnpm", {})
+            if "onlyBuiltDependencies" in pnpm_section:
+                del pnpm_section["onlyBuiltDependencies"]
+                if not pnpm_section:
+                    data.pop("pnpm", None)
+                else:
+                    data["pnpm"] = pnpm_section
+                pkg_json_path.write_text(json.dumps(data, indent=2) + "\n")
+                print_step("Removed stale pnpm.onlyBuiltDependencies from package.json")
+        except Exception:
+            pass
 
 
 def install_dependencies(env, project_dir):
