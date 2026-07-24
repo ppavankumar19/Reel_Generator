@@ -24,7 +24,7 @@ USAGE:
   python3 setup_wilt_reels.py --no-render
 
   # Windows PowerShell
-  python setup_wilt_reels.py --dir %USERPROFILE%\what-i-learned-today-reels
+  python setup_wilt_reels.py --dir %USERPROFILE%\\what-i-learned-today-reels
 """
 
 import argparse
