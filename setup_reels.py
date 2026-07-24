@@ -534,11 +534,12 @@ def _parse_blocked_pkgs(pnpm_output):
 
 def _allow_pnpm_builds(project_dir, pnpm_output):
     """
-    pnpm 9+ blocks package build scripts (ERR_PNPM_IGNORED_BUILDS).
-    In pnpm 10+, the setting moved OUT of package.json into .npmrc.
-    Writes  onlyBuiltDependencies[]=<pkg>  to the project .npmrc file,
-    which is the correct location for all current pnpm versions.
-    Also removes the stale package.json entry that triggers the WARN.
+    Handle ERR_PNPM_IGNORED_BUILDS across pnpm versions:
+      pnpm 10+ → writes onlyBuiltDependencies to pnpm-workspace.yaml
+                  (this is what 'pnpm approve-builds' does internally in v10)
+      pnpm 9.x  → writes onlyBuiltDependencies[]= entries to .npmrc
+      Both      → removes the stale pnpm.onlyBuiltDependencies from package.json
+                  (package.json is no longer read by pnpm 10+ for this key)
     """
     pkgs = _parse_blocked_pkgs(pnpm_output)
     if not pkgs:
@@ -547,36 +548,47 @@ def _allow_pnpm_builds(project_dir, pnpm_output):
 
     print_step(f"Allowing build scripts for: {', '.join(pkgs)}")
 
-    # --- Write to .npmrc (correct location for pnpm 9.x / 10+) ---
+    # --- pnpm 10+: write to pnpm-workspace.yaml ---
+    ws_path = project_dir / "pnpm-workspace.yaml"
+    if ws_path.exists():
+        content = ws_path.read_text()
+        if "onlyBuiltDependencies:" not in content:
+            block = "\nonlyBuiltDependencies:\n" + "".join(f"  - {p}\n" for p in pkgs)
+            ws_path.write_text(content.rstrip("\n") + block)
+            print_success(f"pnpm-workspace.yaml updated with onlyBuiltDependencies: {pkgs}")
+        else:
+            print_success("onlyBuiltDependencies already present in pnpm-workspace.yaml")
+    else:
+        block = "onlyBuiltDependencies:\n" + "".join(f"  - {p}\n" for p in pkgs)
+        ws_path.write_text(block)
+        print_success(f"pnpm-workspace.yaml created with onlyBuiltDependencies: {pkgs}")
+
+    # --- pnpm 9.x fallback: write to .npmrc ---
     npmrc_path = project_dir / ".npmrc"
-    existing = npmrc_path.read_text() if npmrc_path.exists() else ""
+    existing_npmrc = npmrc_path.read_text() if npmrc_path.exists() else ""
     new_lines = [f"onlyBuiltDependencies[]={p}" for p in pkgs
-                 if f"onlyBuiltDependencies[]={p}" not in existing]
+                 if f"onlyBuiltDependencies[]={p}" not in existing_npmrc]
     if new_lines:
         with open(npmrc_path, "a") as f:
-            if existing and not existing.endswith("\n"):
+            if existing_npmrc and not existing_npmrc.endswith("\n"):
                 f.write("\n")
             f.write("# Allow build scripts (added by setup_reels.py)\n")
             for line in new_lines:
                 f.write(line + "\n")
         print_success(f".npmrc updated: {new_lines}")
 
-    # --- Remove stale package.json entry that causes the pnpm WARN ---
+    # --- Remove stale package.json entry (triggers WARN in pnpm 10+) ---
     pkg_json_path = project_dir / "package.json"
     if pkg_json_path.exists():
-        try:
-            data = json.loads(pkg_json_path.read_text())
-            pnpm_section = data.get("pnpm", {})
-            if "onlyBuiltDependencies" in pnpm_section:
-                del pnpm_section["onlyBuiltDependencies"]
-                if not pnpm_section:
-                    data.pop("pnpm", None)
-                else:
-                    data["pnpm"] = pnpm_section
-                pkg_json_path.write_text(json.dumps(data, indent=2) + "\n")
-                print_step("Removed stale pnpm.onlyBuiltDependencies from package.json")
-        except Exception:
-            pass
+        data = json.loads(pkg_json_path.read_text())
+        pnpm_section = data.get("pnpm", {})
+        if "onlyBuiltDependencies" in pnpm_section:
+            del pnpm_section["onlyBuiltDependencies"]
+            data["pnpm"] = pnpm_section if pnpm_section else data.pop("pnpm", None) or {}
+            if not data.get("pnpm"):
+                data.pop("pnpm", None)
+            pkg_json_path.write_text(json.dumps(data, indent=2) + "\n")
+            print_success("Removed stale pnpm.onlyBuiltDependencies from package.json")
 
 
 def install_dependencies(env, project_dir):
