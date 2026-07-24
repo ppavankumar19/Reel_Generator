@@ -372,6 +372,41 @@ def setup_linux(env):
 # COMMON SETUP (ALL PLATFORMS)
 # ============================================================================
 
+def setup_pnpm(env):
+    """Install pnpm 9 — the last major version without ERR_PNPM_IGNORED_BUILDS."""
+    # Check if pnpm v9 is already installed
+    if which("pnpm"):
+        try:
+            ver = subprocess.check_output(["pnpm", "-v"], env=env, text=True).strip()
+            if ver.startswith("9."):
+                print_success(f"pnpm {ver} already installed")
+                return env
+            print_warning(f"pnpm {ver} detected — reinstalling pnpm@9 to avoid build script restrictions")
+        except Exception:
+            pass
+
+    print_step("Installing pnpm@9 globally via npm...")
+    run(get_sudo() + ["npm", "install", "-g", "pnpm@9"], env=env)
+
+    # Ensure npm global bin dir is in PATH
+    try:
+        npm_prefix = subprocess.check_output(
+            ["npm", "config", "get", "prefix"], env=env, text=True
+        ).strip()
+        npm_bin = Path(npm_prefix) / "bin"
+        if npm_bin.exists() and str(npm_bin) not in env.get("PATH", ""):
+            env["PATH"] = str(npm_bin) + os.pathsep + env.get("PATH", "")
+    except Exception:
+        pass
+
+    if not which("pnpm"):
+        raise RuntimeError("pnpm installation failed. Try manually: sudo npm install -g pnpm@9")
+
+    run(["pnpm", "-v"], env=env)
+    print_success("pnpm@9 installed")
+    return env
+
+
 def clone_or_validate_repo(env, repo_url, project_dir):
     package_json = project_dir / "package.json"
 
@@ -396,19 +431,17 @@ def clone_or_validate_repo(env, repo_url, project_dir):
 
 
 def install_dependencies(env, project_dir):
-    """Install project dependencies via npm.
+    """Install project dependencies via pnpm 9.
 
-    npm is used instead of pnpm because pnpm 10+/11+ introduced
-    ERR_PNPM_IGNORED_BUILDS which blocks native packages (esbuild, etc.)
-    from running their build scripts regardless of any config.
-    npm has no such restriction and runs all build scripts normally.
-    All project scripts (render, dev) still work via 'npm run <script>'.
+    pnpm 9 is used because pnpm 10+/11+ introduced ERR_PNPM_IGNORED_BUILDS
+    which blocks native packages (esbuild, etc.) from running build scripts.
+    pnpm 9 has no such restriction and is significantly faster than npm.
     """
     print("\n" + "="*60)
     print("INSTALLING PROJECT DEPENDENCIES")
     print("="*60)
 
-    run(["npm", "install"], env=env, cwd=str(project_dir))
+    run(["pnpm", "install"], env=env, cwd=str(project_dir))
     print_success("Dependencies installed")
 
 
@@ -417,7 +450,7 @@ def render_video(env, project_dir):
     print("RENDERING VIDEO")
     print("="*60)
 
-    run(["npm", "run", "render"], env=env, cwd=str(project_dir))
+    run(["pnpm", "render"], env=env, cwd=str(project_dir))
 
     out_mp4 = project_dir / "out" / "video.mp4"
 
@@ -447,10 +480,10 @@ def print_next_steps(project_dir):
     print(f"   Or edit: {project_dir / 'public' / 'data.json'}")
     print(f"\n🎬 Render again:")
     print(f"   cd {project_dir}")
-    print(f"   npm run render")
+    print(f"   pnpm render")
     print(f"\n🚀 Start development server:")
     print(f"   cd {project_dir}")
-    print(f"   npm run dev")
+    print(f"   pnpm dev")
 
 
 # ============================================================================
@@ -508,6 +541,7 @@ Examples:
     elif os_type == "linux":
         env = setup_linux(env)
 
+    env = setup_pnpm(env)
     clone_or_validate_repo(env, args.repo, project_dir)
     install_dependencies(env, project_dir)
 
