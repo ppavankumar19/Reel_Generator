@@ -500,10 +500,15 @@ def clone_or_validate_repo(env, repo_url, project_dir):
 def _cleanup_prev_run(project_dir):
     """
     Wipe stale artifacts left by any previous failed setup run so that
-    pnpm install always starts from a clean state.  Covers all three
-    locations our script has ever tried to write onlyBuiltDependencies.
+    pnpm install always starts from a clean state.
     """
-    # 1. package.json — written by early script versions (now triggers WARN)
+    # 1. Remove onlyBuiltDependencies set by pnpm config (writes to project .npmrc)
+    subprocess.run(
+        ["pnpm", "config", "delete", "onlyBuiltDependencies", "--location", "project"],
+        cwd=str(project_dir), capture_output=True
+    )
+
+    # 2. package.json — written by early script versions (now triggers WARN in pnpm 10+)
     pkg_json = project_dir / "package.json"
     if pkg_json.exists():
         try:
@@ -520,18 +525,6 @@ def _cleanup_prev_run(project_dir):
         except Exception as e:
             print_warning(f"Could not clean package.json: {e}")
 
-    # 2. .npmrc — written by previous script version
-    npmrc = project_dir / ".npmrc"
-    if npmrc.exists():
-        content = npmrc.read_text()
-        marker = "# Allow build scripts (added by setup_reels.py)"
-        if marker in content or "onlyBuiltDependencies[]=" in content:
-            cleaned = [l for l in content.splitlines()
-                       if l.strip() != marker
-                       and not l.startswith("onlyBuiltDependencies[]=")]
-            npmrc.write_text("\n".join(cleaned).rstrip("\n") + "\n")
-            print_step("Cleaned stale .npmrc entries")
-
     # 3. pnpm-workspace.yaml — if we created it, it only has our block
     ws = project_dir / "pnpm-workspace.yaml"
     if ws.exists():
@@ -545,14 +538,13 @@ def _cleanup_prev_run(project_dir):
             print_step("Removed stale pnpm-workspace.yaml")
 
     # 4. Restore pnpm-lock.yaml from git if we deleted it in a previous run
-    #    so pnpm-workspace.yaml changes are the only diff going into re-resolution
     lockfile = project_dir / "pnpm-lock.yaml"
     if not lockfile.exists() and (project_dir / ".git").exists():
-        result = subprocess.run(
+        r = subprocess.run(
             ["git", "checkout", "HEAD", "--", "pnpm-lock.yaml"],
             cwd=str(project_dir), capture_output=True
         )
-        if result.returncode == 0:
+        if r.returncode == 0:
             print_step("Restored pnpm-lock.yaml from git")
 
 
@@ -573,14 +565,15 @@ def _parse_blocked_pkgs(pnpm_output):
     return pkgs
 
 
-def _allow_pnpm_builds(project_dir, pnpm_output):
+def _allow_pnpm_builds(project_dir, pnpm_output, env):
     """
-    Handle ERR_PNPM_IGNORED_BUILDS across pnpm versions:
-      pnpm 10+ → writes onlyBuiltDependencies to pnpm-workspace.yaml
-                  (this is what 'pnpm approve-builds' does internally in v10)
-      pnpm 9.x  → writes onlyBuiltDependencies[]= entries to .npmrc
-      Both      → removes the stale pnpm.onlyBuiltDependencies from package.json
-                  (package.json is no longer read by pnpm 10+ for this key)
+    Fix ERR_PNPM_IGNORED_BUILDS using pnpm's own config command.
+    'pnpm config set onlyBuiltDependencies <pkg> --location project' writes
+    the setting to .npmrc in exactly the format pnpm expects (unlike manually
+    writing onlyBuiltDependencies[]= which pnpm may not parse correctly).
+    Then delete pnpm-lock.yaml so pnpm re-resolves and picks up the new setting
+    (pnpm caches onlyBuiltDependencies inside the lockfile; without deleting it
+    the retry still reads the old cached value and fails again).
     """
     pkgs = _parse_blocked_pkgs(pnpm_output)
     if not pkgs:
@@ -589,58 +582,21 @@ def _allow_pnpm_builds(project_dir, pnpm_output):
 
     print_step(f"Allowing build scripts for: {', '.join(pkgs)}")
 
-    # --- pnpm 10+: write to pnpm-workspace.yaml ---
-    ws_path = project_dir / "pnpm-workspace.yaml"
-    if ws_path.exists():
-        content = ws_path.read_text()
-        if "onlyBuiltDependencies:" not in content:
-            block = "\nonlyBuiltDependencies:\n" + "".join(f"  - {p}\n" for p in pkgs)
-            ws_path.write_text(content.rstrip("\n") + block)
-            print_success(f"pnpm-workspace.yaml updated with onlyBuiltDependencies: {pkgs}")
-        else:
-            print_success("onlyBuiltDependencies already present in pnpm-workspace.yaml")
-    else:
-        block = "onlyBuiltDependencies:\n" + "".join(f"  - {p}\n" for p in pkgs)
-        ws_path.write_text(block)
-        print_success(f"pnpm-workspace.yaml created with onlyBuiltDependencies: {pkgs}")
+    # Let pnpm write its own config in the correct format
+    for pkg in pkgs:
+        run(
+            ["pnpm", "config", "set", "onlyBuiltDependencies", pkg, "--location", "project"],
+            env=env, cwd=str(project_dir), check=False, capture_output=True
+        )
+    print_success(f"onlyBuiltDependencies set via pnpm config: {pkgs}")
 
-    # --- pnpm 9.x fallback: write to .npmrc ---
-    npmrc_path = project_dir / ".npmrc"
-    existing_npmrc = npmrc_path.read_text() if npmrc_path.exists() else ""
-    new_lines = [f"onlyBuiltDependencies[]={p}" for p in pkgs
-                 if f"onlyBuiltDependencies[]={p}" not in existing_npmrc]
-    if new_lines:
-        with open(npmrc_path, "a") as f:
-            if existing_npmrc and not existing_npmrc.endswith("\n"):
-                f.write("\n")
-            f.write("# Allow build scripts (added by setup_reels.py)\n")
-            for line in new_lines:
-                f.write(line + "\n")
-        print_success(f".npmrc updated: {new_lines}")
-
-    # --- Remove stale package.json entry (triggers WARN in pnpm 10+) ---
-    pkg_json_path = project_dir / "package.json"
-    if pkg_json_path.exists():
-        data = json.loads(pkg_json_path.read_text())
-        pnpm_section = data.get("pnpm", {})
-        if "onlyBuiltDependencies" in pnpm_section:
-            del pnpm_section["onlyBuiltDependencies"]
-            data["pnpm"] = pnpm_section if pnpm_section else data.pop("pnpm", None) or {}
-            if not data.get("pnpm"):
-                data.pop("pnpm", None)
-            pkg_json_path.write_text(json.dumps(data, indent=2) + "\n")
-            print_success("Removed stale pnpm.onlyBuiltDependencies from package.json")
-
-    # --- Delete pnpm-lock.yaml so pnpm regenerates it with the new setting ---
-    # pnpm caches onlyBuiltDependencies INSIDE the lockfile. Even after updating
-    # pnpm-workspace.yaml, if the lockfile is "up to date" pnpm skips re-resolution
-    # and still reads the OLD onlyBuiltDependencies from the lockfile — causing
-    # ERR_PNPM_IGNORED_BUILDS again. Deleting the lockfile forces pnpm to regenerate
-    # it from package.json, picking up the new pnpm-workspace.yaml settings.
+    # Delete lockfile — pnpm caches onlyBuiltDependencies inside pnpm-lock.yaml.
+    # Without deleting it, the retry says "lockfile up to date" and reads the old
+    # cached value, ignoring the .npmrc change we just made.
     lockfile = project_dir / "pnpm-lock.yaml"
     if lockfile.exists():
         lockfile.unlink()
-        print_step("Deleted pnpm-lock.yaml — pnpm will regenerate it with correct settings")
+        print_step("Deleted pnpm-lock.yaml — will regenerate with correct settings")
 
 
 def install_dependencies(env, project_dir):
@@ -667,8 +623,8 @@ def install_dependencies(env, project_dir):
     if result and result.returncode != 0:
         combined = (result.stdout or "") + (result.stderr or "")
         if "ERR_PNPM_IGNORED_BUILDS" in combined or "approve-builds" in combined:
-            print_warning("pnpm 9+ blocked build scripts — auto-approving and retrying...")
-            _allow_pnpm_builds(project_dir, combined)
+            print_warning("pnpm blocked build scripts — auto-approving and retrying...")
+            _allow_pnpm_builds(project_dir, combined, env)
             run(["pnpm", "install"], env=env, cwd=str(project_dir))
         else:
             raise RuntimeError("pnpm install failed (see output above)")
