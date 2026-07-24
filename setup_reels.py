@@ -364,9 +364,6 @@ def setup_linux(env):
     install_package_linux("curl", env)
     install_package_linux("ffmpeg", env)
     install_package_linux("mpv", env, required=False)
-    # Chromium for Remotion rendering — try both package names (distro-dependent)
-    if not install_package_linux("chromium-browser", env, required=False):
-        install_package_linux("chromium", env, required=False)
     env = setup_node_linux(env)
     return env
 
@@ -457,15 +454,22 @@ def install_dependencies(env, project_dir):
 
 
 def _find_system_chromium():
-    """Find system-installed Chromium path."""
+    """Find system-installed Chromium path (apt, snap, or Google Chrome)."""
     for path in (
         "/usr/bin/chromium-browser",
         "/usr/bin/chromium",
+        "/snap/bin/chromium",
         "/usr/bin/google-chrome",
         "/usr/bin/google-chrome-stable",
+        "/usr/bin/google-chrome-beta",
     ):
         if Path(path).exists():
             return path
+    # Also check via which (handles symlinks and custom PATH)
+    for name in ("chromium-browser", "chromium", "google-chrome", "google-chrome-stable"):
+        found = which(name)
+        if found:
+            return found
     return None
 
 
