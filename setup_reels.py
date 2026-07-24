@@ -453,63 +453,6 @@ def install_dependencies(env, project_dir):
     print_success("Dependencies installed")
 
 
-def _find_system_chromium():
-    """Find system-installed Chromium path (apt, snap, or Google Chrome)."""
-    for path in (
-        "/usr/bin/chromium-browser",
-        "/usr/bin/chromium",
-        "/snap/bin/chromium",
-        "/usr/bin/google-chrome",
-        "/usr/bin/google-chrome-stable",
-        "/usr/bin/google-chrome-beta",
-    ):
-        if Path(path).exists():
-            return path
-    # Also check via which (handles symlinks and custom PATH)
-    for name in ("chromium-browser", "chromium", "google-chrome", "google-chrome-stable"):
-        found = which(name)
-        if found:
-            return found
-    return None
-
-
-def render_video(env, project_dir):
-    print("\n" + "="*60)
-    print("RENDERING VIDEO")
-    print("="*60)
-
-    render_env = dict(env)
-    if get_os() == "linux":
-        # Tell Puppeteer/Remotion to skip its own Chromium download
-        # and use the system-installed chromium instead (required on arm64)
-        render_env["PUPPETEER_SKIP_DOWNLOAD"] = "1"
-        chrome = _find_system_chromium()
-        if chrome:
-            render_env["PUPPETEER_EXECUTABLE_PATH"] = chrome
-            print_success(f"Using system Chromium: {chrome}")
-        else:
-            print_warning("System Chromium not found — render may fail")
-
-    run(["pnpm", "render"], env=render_env, cwd=str(project_dir))
-
-    out_mp4 = project_dir / "out" / "video.mp4"
-
-    if out_mp4.exists():
-        print_success("Video rendered successfully!")
-        print(f"\n📹 Output: {out_mp4}")
-
-        os_type = get_os()
-        if os_type == "windows":
-            print(f"\nPlay: start \"{out_mp4}\"")
-        elif os_type == "macos":
-            print(f"\nPlay: mpv '{out_mp4}' OR open '{out_mp4}'")
-        else:
-            print(f"\nPlay: mpv '{out_mp4}' OR xdg-open '{out_mp4}'")
-    else:
-        print_warning("Render completed but output file not found at expected location")
-        print(f"Expected: {out_mp4}")
-
-
 def print_next_steps(project_dir):
     print("\n" + "="*60)
     print("NEXT STEPS")
@@ -542,9 +485,6 @@ Examples:
   # Custom directory
   python3 setup_reels.py --dir ~/my-reels
 
-  # Setup without rendering
-  python3 setup_reels.py --no-render
-
   # Windows
   python setup_reels.py --dir %USERPROFILE%\\what-i-learned-today-reels
         """
@@ -557,9 +497,6 @@ Examples:
                         help=f"Git repository URL (default: {REPO_URL})")
     parser.add_argument("--dir", default=str(default_dir),
                         help=f"Project directory (default: {default_dir})")
-    parser.add_argument("--no-render", action="store_true",
-                        help="Skip video rendering (setup only)")
-
     args = parser.parse_args()
 
     env = dict(os.environ)
@@ -584,11 +521,6 @@ Examples:
     env = setup_pnpm(env)
     clone_or_validate_repo(env, args.repo, project_dir)
     install_dependencies(env, project_dir)
-
-    if not args.no_render:
-        render_video(env, project_dir)
-    else:
-        print_warning("Video rendering skipped (--no-render)")
 
     print_next_steps(project_dir)
 
