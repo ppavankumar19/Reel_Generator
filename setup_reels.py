@@ -472,17 +472,41 @@ def setup_pnpm(env):
     return env
 
 
-def setup_pnpm_build_config(env):
+def write_pnpm_workspace_yaml(project_dir, pkgs):
     """
-    Set pnpm config to allow build scripts for native packages BEFORE cloning.
-    Writing this globally means it applies when pnpm install runs in any project
-    directory, so no project-level file patching is needed.
+    Write onlyBuiltDependencies to pnpm-workspace.yaml.
+    pnpm 10+/11+ ONLY reads this setting from pnpm-workspace.yaml —
+    not from package.json (deprecated) and not from .npmrc (ignored for this key).
     """
-    print_step("Configuring pnpm to allow build scripts for native packages...")
-    # pnpm config set without --location writes to the user-level ~/.npmrc
-    run(["pnpm", "config", "set", "onlyBuiltDependencies", "esbuild"],
-        env=env, check=False, capture_output=True)
-    print_success("pnpm global config: onlyBuiltDependencies = esbuild")
+    ws = project_dir / "pnpm-workspace.yaml"
+    if ws.exists():
+        content = ws.read_text()
+        if "onlyBuiltDependencies:" in content:
+            missing = [p for p in pkgs if f"  - {p}" not in content]
+            if not missing:
+                print_success("pnpm-workspace.yaml already has onlyBuiltDependencies")
+                return
+            # Append missing entries to the existing block
+            lines = content.splitlines()
+            out, in_block = [], False
+            for line in lines:
+                if line.startswith("onlyBuiltDependencies:"):
+                    in_block = True
+                elif in_block and not (line.startswith("  ") or line.strip() == ""):
+                    for p in missing:
+                        out.append(f"  - {p}")
+                    in_block = False
+                out.append(line)
+            if in_block:
+                for p in missing:
+                    out.append(f"  - {p}")
+            ws.write_text("\n".join(out) + "\n")
+        else:
+            block = "\nonlyBuiltDependencies:\n" + "".join(f"  - {p}\n" for p in pkgs)
+            ws.write_text(content.rstrip("\n") + block)
+    else:
+        ws.write_text("onlyBuiltDependencies:\n" + "".join(f"  - {p}\n" for p in pkgs))
+    print_success(f"pnpm-workspace.yaml: onlyBuiltDependencies = {pkgs}")
 
 
 def clone_or_validate_repo(env, repo_url, project_dir):
@@ -618,18 +642,24 @@ def install_dependencies(env, project_dir):
     print("INSTALLING PROJECT DEPENDENCIES")
     print("="*60)
 
-    # Delete the committed pnpm-lock.yaml before installing.
-    # The repo's lockfile was created before onlyBuiltDependencies was configured,
-    # so it has the wrong value baked in. Pnpm reads onlyBuiltDependencies FROM
-    # the lockfile (not from config) when the lockfile is "up to date", which
-    # causes ERR_PNPM_IGNORED_BUILDS even after setting pnpm config.
-    # Deleting it forces pnpm to re-resolve from package.json and pick up
-    # the global config we set in setup_pnpm_build_config().
+    # Step 1 — write onlyBuiltDependencies to pnpm-workspace.yaml.
+    # pnpm 11 reads this setting ONLY from pnpm-workspace.yaml; .npmrc and
+    # package.json are both ignored for this key in pnpm 10+/11+.
+    write_pnpm_workspace_yaml(project_dir, ["esbuild"])
+
+    # Step 2 — delete the committed lockfile.
+    # The lockfile bakes in onlyBuiltDependencies at the time it was created
+    # (before we set it). pnpm reads that cached value instead of re-reading
+    # pnpm-workspace.yaml when the lockfile is present and "up to date".
+    # Deleting it forces a full re-resolve that picks up the new workspace config.
     lockfile = project_dir / "pnpm-lock.yaml"
     if lockfile.exists():
         lockfile.unlink()
-        print_step("Deleted pnpm-lock.yaml — forcing fresh resolution with correct build config")
+        print_step("Deleted pnpm-lock.yaml — will re-resolve with correct build config")
 
+    # Step 3 — install. pnpm will re-resolve from package.json, read
+    # pnpm-workspace.yaml, generate a new lockfile with esbuild allowed,
+    # then run esbuild's build script. Should succeed first time.
     run(["pnpm", "install"], env=env, cwd=str(project_dir))
     print_success("Dependencies installed")
 
@@ -748,9 +778,6 @@ Examples:
     
     # Install pnpm
     env = setup_pnpm(env)
-
-    # Configure pnpm globally BEFORE cloning so pnpm install works first time
-    setup_pnpm_build_config(env)
 
     # Clone repository
     clone_or_validate_repo(env, args.repo, project_dir)
