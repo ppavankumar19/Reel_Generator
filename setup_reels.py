@@ -443,31 +443,16 @@ def setup_linux(env):
 # ============================================================================
 
 def setup_pnpm(env):
-    """Install pnpm package manager."""
+    """Install pnpm package manager via sudo npm install -g pnpm."""
     if which("pnpm"):
         print_success("pnpm already installed")
         run(["pnpm", "-v"], env=env)
         return env
 
-    print_step("Installing pnpm...")
+    print_step("Installing pnpm globally via npm (sudo)...")
+    run(get_sudo() + ["npm", "install", "-g", "pnpm"], env=env)
 
-    # Try corepack first (bundled with Node.js 16+)
-    if which("corepack"):
-        print_step("Enabling pnpm via corepack...")
-        # corepack enable writes shims to a system dir — needs sudo when Node is system-installed
-        run(get_sudo() + ["corepack", "enable"], env=env, check=False)
-        run(["corepack", "prepare", "pnpm@latest", "--activate"], env=env, check=False)
-
-    if which("pnpm"):
-        print_success("pnpm enabled via corepack")
-        run(["pnpm", "-v"], env=env)
-        return env
-
-    # Fallback: npm global install
-    print_step("Installing pnpm globally via npm...")
-    run(["npm", "install", "-g", "pnpm"], env=env)
-
-    # npm global installs land in $(npm config get prefix)/bin — add to PATH
+    # Ensure npm global bin dir is in PATH (needed if it wasn't already)
     try:
         npm_prefix = subprocess.check_output(
             ["npm", "config", "get", "prefix"], env=env, text=True
@@ -480,13 +465,10 @@ def setup_pnpm(env):
         pass
 
     if not which("pnpm"):
-        raise RuntimeError(
-            "pnpm installation failed. Try manually: npm install -g pnpm"
-        )
+        raise RuntimeError("pnpm installation failed. Try manually: sudo npm install -g pnpm")
 
     run(["pnpm", "-v"], env=env)
     print_success("pnpm installed")
-
     return env
 
 
@@ -513,6 +495,54 @@ def clone_or_validate_repo(env, repo_url, project_dir):
         raise RuntimeError(f"Clone succeeded but package.json not found in {project_dir}")
 
     print_success("Repository cloned successfully")
+
+
+def _cleanup_prev_run(project_dir):
+    """
+    Wipe stale artifacts left by any previous failed setup run so that
+    pnpm install always starts from a clean state.  Covers all three
+    locations our script has ever tried to write onlyBuiltDependencies.
+    """
+    # 1. package.json — written by early script versions (now triggers WARN)
+    pkg_json = project_dir / "package.json"
+    if pkg_json.exists():
+        try:
+            data = json.loads(pkg_json.read_text())
+            pnpm_cfg = data.get("pnpm", {})
+            if "onlyBuiltDependencies" in pnpm_cfg:
+                pnpm_cfg.pop("onlyBuiltDependencies")
+                if pnpm_cfg:
+                    data["pnpm"] = pnpm_cfg
+                else:
+                    data.pop("pnpm", None)
+                pkg_json.write_text(json.dumps(data, indent=2) + "\n")
+                print_step("Cleaned stale pnpm.onlyBuiltDependencies from package.json")
+        except Exception as e:
+            print_warning(f"Could not clean package.json: {e}")
+
+    # 2. .npmrc — written by previous script version
+    npmrc = project_dir / ".npmrc"
+    if npmrc.exists():
+        content = npmrc.read_text()
+        marker = "# Allow build scripts (added by setup_reels.py)"
+        if marker in content or "onlyBuiltDependencies[]=" in content:
+            cleaned = [l for l in content.splitlines()
+                       if l.strip() != marker
+                       and not l.startswith("onlyBuiltDependencies[]=")]
+            npmrc.write_text("\n".join(cleaned).rstrip("\n") + "\n")
+            print_step("Cleaned stale .npmrc entries")
+
+    # 3. pnpm-workspace.yaml — if we created it, it only has our block
+    ws = project_dir / "pnpm-workspace.yaml"
+    if ws.exists():
+        lines = [l for l in ws.read_text().splitlines() if l.strip()]
+        is_ours = all(
+            l.startswith("onlyBuiltDependencies:") or l.strip().startswith("- ")
+            for l in lines
+        )
+        if is_ours:
+            ws.unlink()
+            print_step("Removed stale pnpm-workspace.yaml")
 
 
 def _parse_blocked_pkgs(pnpm_output):
@@ -596,6 +626,9 @@ def install_dependencies(env, project_dir):
     print("\n" + "="*60)
     print("INSTALLING PROJECT DEPENDENCIES")
     print("="*60)
+
+    # Always wipe stale artifacts from any previous failed run before starting
+    _cleanup_prev_run(project_dir)
 
     result = run(
         ["pnpm", "install"], env=env, cwd=str(project_dir),
