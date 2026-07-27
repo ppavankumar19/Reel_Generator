@@ -198,6 +198,7 @@ def setup_windows(env):
     env = setup_chocolatey_windows(env)
     install_package_windows(env, "git")
     install_package_windows(env, "ffmpeg")
+    install_package_windows(env, "chromium")
     env = setup_node_windows(env)
     return env
 
@@ -249,6 +250,16 @@ def brew_install(env, formula):
     print_success(f"{formula} installed")
 
 
+def brew_cask_install(env, cask):
+    rc = run(["brew", "list", "--cask", cask], env=env, check=False, capture_output=True)
+    if rc and rc.returncode == 0:
+        print_success(f"{cask} (cask) already installed")
+        return
+    print_step(f"Installing {cask} via Homebrew Cask...")
+    run(["brew", "install", "--cask", cask], env=env)
+    print_success(f"{cask} installed")
+
+
 def setup_node_macos(env):
     if which("node"):
         print_success("Node.js already installed")
@@ -284,6 +295,7 @@ def setup_macos(env):
     brew_install(env, "git")
     brew_install(env, "ffmpeg")
     brew_install(env, "mpv")
+    brew_cask_install(env, "chromium")
     env = setup_node_macos(env)
     return env
 
@@ -349,6 +361,25 @@ def setup_node_linux(env):
     return env
 
 
+def install_chromium_linux(env):
+    """Install Chromium (required by Remotion for rendering)."""
+    for pkg in ("chromium-browser", "chromium"):
+        result = run(["dpkg", "-s", pkg], check=False, capture_output=True)
+        if result and result.returncode == 0 and "Status: install ok installed" in result.stdout:
+            print_success(f"Chromium already installed ({pkg})")
+            return
+    for pkg in ("chromium-browser", "chromium"):
+        result = run(
+            get_sudo() + ["apt-get", "install", "-y", "--no-install-recommends", pkg],
+            env=apt_env(env),
+            check=False,
+        )
+        if result and result.returncode == 0:
+            print_success(f"Chromium installed ({pkg})")
+            return
+    print_warning("Could not install Chromium — 'pnpm render' may fail without it")
+
+
 def setup_linux(env):
     headless = is_wsl()
 
@@ -364,6 +395,7 @@ def setup_linux(env):
     install_package_linux("curl", env)
     install_package_linux("ffmpeg", env)
     install_package_linux("mpv", env, required=False)
+    install_chromium_linux(env)
     env = setup_node_linux(env)
     return env
 
